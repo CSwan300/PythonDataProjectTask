@@ -30,4 +30,4 @@ Use custom logs:
 Replace sample-log.log with your log file
 
 ## Docker 
-I have no idea how you could run this in docker non locally as this was my frist every experience off docker and matlabplot in python.
+I have no idea how you could run this in docker non locally as this was my frist ever experience off docker and matlabplot in python.
