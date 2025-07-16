@@ -46,18 +46,33 @@ def is_bot(user_agent):
     return any(indicator in ua_lower for indicator in bot_indicators)
 
 
-def analyze_log_line(line):
+def is_high_request_ip(ip, ip_counts):
+    """Check if IP has made more than 10 requests"""
+    return ip_counts.get(ip, 0) > 10
+
+
+def analyze_log_line(line, high_request_ips=None):
+    """
+    Analyze a log line with optional high-request IP list
+    high_request_ips: Set of IPs with >10 requests (from first pass)
+    """
     problems = []
     bot_detected = False
     bot_name = None
+    is_high_request = False
 
     pattern = r'^(\S+) - (\S+) - \[(.*?)\] "(\S+) (\S+) (\S+)" (\d{3}) (\d+) "([^"]*)" "([^"]*)" (\d+)$'
     match = re.match(pattern, line.strip())
 
     if not match:
-        return ["Malformed log entry"], None, False, None
+        return ["Malformed log entry"], None, False, None, False
 
     ip, auth, timestamp, method, path, protocol, status, bytes_sent, referer, user_agent, response_time = match.groups()
+
+    # High request check (if we have the IP list)
+    if high_request_ips and ip in high_request_ips:
+        is_high_request = True
+        problems.append("High request count (potential bot)")
 
     # Convert numerical values
     try:
@@ -66,9 +81,9 @@ def analyze_log_line(line):
         bytes_transferred = int(bytes_sent)
     except ValueError:
         problems.append("Invalid numerical values")
-        return problems, None, False, None
+        return problems, None, False, None, is_high_request
 
-    # Bot detection
+    # Bot detection (user agent based)
     if is_bot(user_agent):
         bot_detected = True
         # Try to extract bot name
@@ -131,7 +146,7 @@ def analyze_log_line(line):
         'user_agent': user_agent
     }
 
-    return problems, data_point, bot_detected, bot_name
+    return problems, data_point, bot_detected, bot_name, is_high_request
 
 
 def visualize_data(problem_counts, status_codes, response_times, total_lines,
@@ -238,17 +253,23 @@ def visualize_data(problem_counts, status_codes, response_times, total_lines,
                  ha='center', va='center', fontsize=12)
         plt.title('No HTTP Methods Found')
 
-    # Bot Traffic Analysis
+    # Traffic Composition (Updated to include high-request IPs)
     plt.subplot(3, 3, 7)
-    if bot_stats['total_bots'] > 0:
-        labels = ['Human Traffic', 'Bot Traffic']
-        sizes = [total_lines - bot_stats['total_bots'], bot_stats['total_bots']]
-        colors = ['#66b3ff', '#ff9999']
-        explode = (0.1, 0)  # explode the bot slice
+    human_traffic = total_lines - bot_stats['total_bots'] - bot_stats['high_request_bots']
+    if human_traffic < total_lines:  # Only show if we have non-human traffic
+        sizes = [
+            human_traffic,
+            bot_stats['total_bots'],
+            bot_stats['high_request_bots']
+        ]
+        labels = ['Human Traffic', 'Known Bots', 'High-Request IPs']
+        colors = ['#66b3ff', '#ff9999', '#ffcc99']
+        explode = (0.1, 0, 0.1)
+
         plt.pie(sizes, explode=explode, labels=labels, colors=colors,
                 autopct='%1.1f%%', shadow=True, startangle=90)
         plt.axis('equal')
-        plt.title('Bot vs Human Traffic')
+        plt.title('Traffic Composition')
     else:
         plt.text(0.5, 0.5, 'No bot traffic detected',
                  ha='center', va='center', fontsize=12)
@@ -315,17 +336,33 @@ def main():
         'total_bots': 0,
         'bot_ips': Counter(),
         'bot_paths': Counter(),
-        'bot_status_codes': Counter()
+        'bot_status_codes': Counter(),
+        'high_request_bots': 0
     }
     bot_types = Counter()
-
-    # Store problematic entries for output
     problematic_entries = []
 
+    # FIRST PASS: Collect IP counts
+    print("First pass: Counting IP requests...")
+    with open(LOCAL_LOG_FILE, 'r') as file:
+        for line in file:
+            match = re.match(r'^(\S+) -', line.strip())
+            if match:
+                ip = match.group(1)
+                ip_addresses[ip] += 1
+
+    # Identify high-request IPs (>10 requests)
+    high_request_ips = {ip for ip, count in ip_addresses.items() if count > 10}
+    print(f"Found {len(high_request_ips)} IPs with >10 requests")
+
+    # SECOND PASS: Full analysis
+    print("\nSecond pass: Analyzing log entries...")
     with open(LOCAL_LOG_FILE, 'r') as file:
         for line_number, line in enumerate(file, 1):
             total_lines += 1
-            issues, data_point, is_bot, bot_name = analyze_log_line(line)
+            issues, data_point, is_bot_flag, bot_name, is_high_request = analyze_log_line(
+                line, high_request_ips
+            )
 
             # Collect data for visualization
             if data_point:
@@ -339,14 +376,11 @@ def main():
                 if 'Suspicious path' in issues:
                     suspicious_paths[data_point['path']] += 1
 
-                # Track IP addresses
-                ip_addresses[data_point['ip']] += 1
-
                 # Track HTTP methods
                 http_methods[data_point['method']] += 1
 
                 # Bot-specific tracking
-                if is_bot:
+                if is_bot_flag:
                     bot_stats['total_bots'] += 1
                     bot_stats['bot_ips'][data_point['ip']] += 1
                     bot_stats['bot_paths'][data_point['path']] += 1
@@ -355,11 +389,15 @@ def main():
                     if bot_name:
                         bot_types[bot_name] += 1
 
+                # Track high-request IPs (that aren't already identified as bots)
+                if is_high_request and not is_bot_flag:
+                    bot_stats['high_request_bots'] += 1
+
             if issues:
                 problem_lines += 1
                 problem_counts.update(issues)
 
-                # Store request details and issues
+                # Store problematic entry
                 if data_point:
                     entry = {
                         'line': line_number,
@@ -369,7 +407,7 @@ def main():
                         'status': data_point['status'],
                         'response_time': data_point['response_time'],
                         'bytes': data_point['bytes'],
-                        'issues': list(issues)  # Convert set to list
+                        'issues': list(set(issues))  # Remove duplicates
                     }
                     problematic_entries.append(entry)
 
@@ -381,7 +419,8 @@ def main():
     print("\nAnalysis Summary:")
     print(f"Total lines processed: {total_lines}")
     print(f"Problematic lines found: {problem_lines}")
-    print(f"Bot traffic detected: {bot_stats['total_bots']} ({bot_stats['total_bots'] / total_lines * 100:.2f}%)")
+    print(f"Known bots detected: {bot_stats['total_bots']} ({bot_stats['total_bots'] / total_lines * 100:.2f}%)")
+    print(f"High-request IPs detected: {bot_stats['high_request_bots']} ({bot_stats['high_request_bots'] / total_lines * 100:.2f}%)")
 
     if total_lines > 0:
         print(f"Percentage problematic: {problem_lines / total_lines * 100:.2f}%")
@@ -400,9 +439,10 @@ def main():
             print(f"  {ip}: {count} requests")
 
     # Bot summary
-    if bot_stats['total_bots'] > 0:
+    if bot_stats['total_bots'] > 0 or bot_stats['high_request_bots'] > 0:
         print("\nBot Traffic Analysis:")
-        print(f"Total bot requests: {bot_stats['total_bots']}")
+        print(f"Total known bot requests: {bot_stats['total_bots']}")
+        print(f"Total high-request IPs: {bot_stats['high_request_bots']}")
         print(f"Top bot types: {bot_types.most_common(5)}")
         print(f"Top bot IPs: {bot_stats['bot_ips'].most_common(5)}")
         print(f"Top paths accessed by bots: {bot_stats['bot_paths'].most_common(5)}")
@@ -441,7 +481,7 @@ def main():
         import matplotlib
         print("\nGenerating visualizations...")
         visualize_data(problem_counts, status_codes, response_times, total_lines,
-                       suspicious_paths, Counter(ip_addresses), bot_stats, bot_types)
+                       suspicious_paths, ip_addresses, bot_stats, bot_types)
     except ImportError:
         print("\nVisualization skipped: matplotlib not installed.")
         print("Install it with: pip install matplotlib")
