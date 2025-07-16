@@ -319,8 +319,11 @@ def main():
     }
     bot_types = Counter()
 
+    # Store problematic entries for output
+    problematic_entries = []
+
     with open(LOCAL_LOG_FILE, 'r') as file:
-        for line in file:
+        for line_number, line in enumerate(file, 1):
             total_lines += 1
             issues, data_point, is_bot, bot_name = analyze_log_line(line)
 
@@ -356,6 +359,20 @@ def main():
                 problem_lines += 1
                 problem_counts.update(issues)
 
+                # Store request details and issues
+                if data_point:
+                    entry = {
+                        'line': line_number,
+                        'ip': data_point['ip'],
+                        'method': data_point['method'],
+                        'path': data_point['path'],
+                        'status': data_point['status'],
+                        'response_time': data_point['response_time'],
+                        'bytes': data_point['bytes'],
+                        'issues': list(issues)  # Convert set to list
+                    }
+                    problematic_entries.append(entry)
+
     # Attach additional data to visualization function
     visualize_data.http_methods = http_methods
     visualize_data.bot_status_codes = bot_stats['bot_status_codes']
@@ -390,6 +407,34 @@ def main():
         print(f"Top bot IPs: {bot_stats['bot_ips'].most_common(5)}")
         print(f"Top paths accessed by bots: {bot_stats['bot_paths'].most_common(5)}")
         print(f"Bot status codes: {bot_stats['bot_status_codes'].most_common(5)}")
+
+    # Print problematic HTTP requests
+    if problematic_entries:
+        print("\nProblematic HTTP Requests (First 10):")
+        print("Line | IP Address    | Method | Path                 | Status | Time(ms) | Size   | Issues")
+        print("-" * 95)
+
+        for entry in problematic_entries[:10]:
+            print(
+                f"{entry['line']:<4} | {entry['ip']:<13} | {entry['method']:<6} | "
+                f"{entry['path'][:20]:<20} | {entry['status']:<6} | "
+                f"{entry['response_time']:<8} | {entry['bytes']:<6} | {', '.join(entry['issues'][:2])}"
+            )
+
+        # Save full report to file
+        with open('problematic_requests.log', 'w') as f:
+            f.write("Full List of Problematic Requests:\n")
+            f.write("Line | IP Address    | Method | Path                 | Status | Time(ms) | Size   | Issues\n")
+            f.write("-" * 95 + "\n")
+            for entry in problematic_entries:
+                f.write(
+                    f"{entry['line']:<4} | {entry['ip']:<13} | {entry['method']:<6} | "
+                    f"{entry['path'][:20]:<20} | {entry['status']:<6} | "
+                    f"{entry['response_time']:<8} | {entry['bytes']:<6} | {', '.join(entry['issues'])}\n"
+                )
+        print(f"\nSaved full report of {len(problematic_entries)} problematic requests to 'problematic_requests.log'")
+    else:
+        print("\nNo problematic requests found")
 
     # Generate visualizations
     try:
