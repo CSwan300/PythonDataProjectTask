@@ -47,14 +47,13 @@ def is_bot(user_agent):
 
 
 def is_high_request_ip(ip, ip_counts):
-    """Check if IP has made more than 10 requests"""
-    return ip_counts.get(ip, 0) > 10
-
+    """Check if IP has made more than 100 requests"""
+    return ip_counts.get(ip, 0) > 30
 
 def analyze_log_line(line, high_request_ips=None):
     """
     Analyze a log line with optional high-request IP list
-    high_request_ips: Set of IPs with >10 requests (from first pass)
+    high_request_ips: Set of IPs with >100 requests (from first pass)
     """
     problems = []
     bot_detected = False
@@ -351,9 +350,9 @@ def main():
                 ip = match.group(1)
                 ip_addresses[ip] += 1
 
-    # Identify high-request IPs (>10 requests)
-    high_request_ips = {ip for ip, count in ip_addresses.items() if count > 10}
-    print(f"Found {len(high_request_ips)} IPs with >10 requests")
+    # Identify high-request IPs (>100  requests)
+    high_request_ips = {ip for ip, count in ip_addresses.items() if count > 30}
+    print(f"Found {len(high_request_ips)} IPs with >100 requests")
 
     # SECOND PASS: Full analysis
     print("\nSecond pass: Analyzing log entries...")
