@@ -1,6 +1,6 @@
 # Log Analysis and Visualization Tool
 ### Extra info 
-this was my first time ever using Matlabplot or python for Data Analysis
+this was my first time ever using matplotlib or python for data analysis
 aswell as docker implementation.
 
 ## Overview
