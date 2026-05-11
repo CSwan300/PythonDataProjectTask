@@ -1,0 +1,24 @@
+services:
+  log-analyzer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: log_analyzer
+
+    environment:
+      - MPLBACKEND=Agg
+      - OUTPUT_DIR=/app/output
+
+    volumes:
+      # Reports and charts will appear in ./output on your host
+      - ./output:/app/output
+      # Optionally mount a pre-downloaded log file to skip the network fetch:
+      # - ./sample-log.log:/app/sample-log.log:ro
+
+    restart: on-failure
+
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M

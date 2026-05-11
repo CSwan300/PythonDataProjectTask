@@ -1,23 +1,22 @@
-FROM python:3.11-slim
+FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    MPLBACKEND=Agg \
+    OUTPUT_DIR=/app/output
 
-# Use root directory
-WORKDIR /
-
-RUN apt-get update && apt-get install -y \
-    build-essential \
-    libpq-dev \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libfreetype6-dev \
+    libpng-dev \
     && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy to root
-COPY . .
+COPY main.py .
 
-EXPOSE 8000
+RUN mkdir -p /app/output
 
-# Run from root
-CMD ["python", "/Main.py"]
+CMD ["python", "main.py"]

@@ -1,12 +1,12 @@
 """
 Web Server Log Analysis Tool
 
-This script analyzes web server log files to identify various issues, suspicious activities,
-and traffic patterns. It performs both technical analysis and visualization of log data.
+Analyzes web server log files to identify issues, suspicious activities,
+and traffic patterns. Performs both technical analysis and visualization.
 
 Key Features:
-- Automated log file download from GitHub
-- Two-pass analysis for efficient processing
+- Automated log file download from GitHub (streamed, size-limited)
+- Single-pass IP counting + deferred flagging
 - Bot detection using user agent analysis
 - Suspicious activity identification
 - Comprehensive visualization dashboard
@@ -15,372 +15,303 @@ Key Features:
 
 import re
 import os
-import matplotlib.pyplot as plt
+import logging
 from datetime import datetime
-import requests
-from collections import defaultdict, Counter
-import numpy as np
+from dataclasses import dataclass
+from collections import Counter
+from typing import Optional
 
-# GitHub raw URL for the log file and local file name
+import matplotlib
+matplotlib.use("Agg")  # Non-interactive backend — must be set before importing pyplot
+import matplotlib.pyplot as plt
+import requests
+
+# ---------------------------------------------------------------------------
+# Configuration constants
+# ---------------------------------------------------------------------------
+
 GITHUB_LOG_URL = "https://raw.githubusercontent.com/brightnetwork/ieuk-task-2025/main/sample-log.log"
 LOCAL_LOG_FILE = "sample-log.log"
 
+OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "output")
 
-def download_log_file():
+HIGH_REQUEST_THRESHOLD = 30
+SLOW_RESPONSE_MS = 500
+LARGE_TRANSFER_BYTES = 1_000_000
+DOWNLOAD_TIMEOUT_S = 30
+MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024  # 50 MB
+
+# ---------------------------------------------------------------------------
+# Compiled regex patterns (compiled once at import time)
+# ---------------------------------------------------------------------------
+
+LOG_PATTERN = re.compile(
+    r'^(\S+) - (\S+) - \[(.*?)\] "(\S+) (\S+) (\S+)" (\d{3}) (\d+) "([^"]*)" "([^"]*)" (\d+)$'
+)
+
+SUSPICIOUS_PATH_RE = re.compile(
+    r'(admin|login|wp-admin|\.php|\.env|config|\.\./|/cgi-bin/)',
+    re.IGNORECASE,
+)
+
+BOT_RE = re.compile(
+    r'\b(bot|crawler|spider|scraper|feed|crawl|slurp|teoma|curl|wget|'
+    r'python-requests|httpclient|apache-httpclient|node-fetch|okhttp|'
+    r'libwww|zgrab|panscient|nmap)\b|'
+    r'(google|bing|yahoo|baidu|yandex|duckduck|go-http|php|ruby|java)',
+    re.IGNORECASE,
+)
+
+# ---------------------------------------------------------------------------
+# Logging setup
+# ---------------------------------------------------------------------------
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Data structures
+# ---------------------------------------------------------------------------
+
+@dataclass
+#These can be configured
+class LogEntry:
+    ip: str
+    auth: str
+    timestamp: str
+    method: str
+    path: str
+    protocol: str
+    status: int
+    bytes_sent: int
+    referer: str
+    user_agent: str
+    response_time: int
+
+
+@dataclass
+class AnalysisResult:
+    total_lines: int
+    problem_lines: int
+    problem_counts: Counter
+    status_codes: Counter
+    response_times: list
+    suspicious_paths: Counter
+    ip_addresses: Counter
+    http_methods: Counter
+    bot_stats: dict
+    bot_types: Counter
+    problematic_entries: list
+
+
+# ---------------------------------------------------------------------------
+# Download
+# ---------------------------------------------------------------------------
+
+def download_log_file() -> bool:
     """
-    Download the log file from GitHub if it doesn't exist locally
+    Stream the log file from GitHub if it does not exist locally.
+    Enforces a timeout and a maximum file size.
 
     Returns:
-        bool: True if file is available (either downloaded or exists locally), False otherwise
+        True if the file is available, False otherwise.
     """
-    if not os.path.exists(LOCAL_LOG_FILE):
-        print(f"Downloading log file from GitHub...")
-        try:
-            response = requests.get(GITHUB_LOG_URL)
-            response.raise_for_status()  # Raise error for bad status codes
+    if os.path.exists(LOCAL_LOG_FILE):
+        return True
 
-            with open(LOCAL_LOG_FILE, 'w') as f:
-                f.write(response.text)
-            print(f"Log file downloaded successfully: {LOCAL_LOG_FILE}")
-            return True
-        except Exception as e:
-            print(f"Error downloading log file: {e}")
-            return False
-    return True
-
-
-def is_bot(user_agent):
-    """
-    Detect if the request comes from a bot/crawler based on user agent string
-
-    Args:
-        user_agent (str): The User-Agent header from the HTTP request
-
-    Returns:
-        bool: True if bot detected, False otherwise
-    """
-    if not user_agent or user_agent == '-':
+    log.info("Downloading log file from GitHub...")
+    try:
+        with requests.get(GITHUB_LOG_URL, stream=True, timeout=DOWNLOAD_TIMEOUT_S) as response:
+            response.raise_for_status()
+            with open(LOCAL_LOG_FILE, "wb") as f:
+                downloaded = 0
+                for chunk in response.iter_content(chunk_size=65_536):
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if downloaded > MAX_DOWNLOAD_BYTES:
+                        raise ValueError(
+                            f"Log file exceeds the {MAX_DOWNLOAD_BYTES // (1024 * 1024)} MB size limit."
+                        )
+        log.info("Download complete: %s", LOCAL_LOG_FILE)
+        return True
+    except Exception as exc:
+        log.error("Failed to download log file: %s", exc)
         return False
 
-    # List of common bot indicators in user agent strings
-    bot_indicators = [
-        'bot', 'crawler', 'spider', 'scraper', 'feed', 'crawl',
-        'google', 'bing', 'yahoo', 'baidu', 'yandex', 'duckduck',
-        'slurp', 'teoma', 'ask jeeves', 'curl', 'wget', 'python-requests',
-        'java', 'httpclient', 'apache-httpclient', 'php', 'ruby', 'go-http',
-        'node-fetch', 'okhttp', 'libwww', 'zgrab', 'panscient', 'nmap'
-    ]
 
+# ---------------------------------------------------------------------------
+# Bot detection
+# ---------------------------------------------------------------------------
+
+def is_bot(user_agent: str) -> bool:
+    """
+    Detect whether a request comes from a bot/crawler.
+
+    Uses word-boundary matching to reduce false positives from
+    substrings (e.g. 'java' inside a legitimate browser UA).
+
+    Args:
+        user_agent: The User-Agent header string.
+
+    Returns:
+        True if a bot pattern is detected.
+    """
+    if not user_agent or user_agent == "-":
+        return False
+    return bool(BOT_RE.search(user_agent))
+
+
+def extract_bot_name(user_agent: str) -> str:
+    """
+    Return a human-readable name for a detected bot.
+
+    Args:
+        user_agent: The User-Agent header string.
+
+    Returns:
+        A short bot name string.
+    """
     ua_lower = user_agent.lower()
-    return any(indicator in ua_lower for indicator in bot_indicators)
+    if "google" in ua_lower:
+        return "Googlebot"
+    if "bing" in ua_lower:
+        return "Bingbot"
+    if "yahoo" in ua_lower:
+        return "Yahoo Slurp"
+    if "baidu" in ua_lower:
+        return "Baiduspider"
+    if "yandex" in ua_lower:
+        return "YandexBot"
+    bot_match = re.search(r'(\w+bot/[\d.]+|\w+bot)', user_agent, re.IGNORECASE)
+    if bot_match:
+        return bot_match.group(1)
+    return "Unknown Bot"
 
 
-def is_high_request_ip(ip, ip_counts):
+# ---------------------------------------------------------------------------
+# Log line parsing
+# ---------------------------------------------------------------------------
+
+def parse_log_line(line: str) -> Optional[LogEntry]:
     """
-    Check if an IP has made an unusually high number of requests
+    Parse a single log line into a LogEntry dataclass.
 
     Args:
-        ip (str): IP address to check
-        ip_counts (dict): Dictionary of IP addresses and their request counts
+        line: A raw log line string.
 
     Returns:
-        bool: True if IP has made more than 30 requests, False otherwise
+        A LogEntry on success, or None if the line is malformed.
     """
-    return ip_counts.get(ip, 0) > 30
-
-
-def analyze_log_line(line, high_request_ips=None):
-    """
-    Analyze a single log line and identify potential issues
-
-    Args:
-        line (str): A single line from the log file
-        high_request_ips (set, optional): Set of IPs with high request counts
-
-    Returns:
-        tuple: (problems, data_point, bot_detected, bot_name, is_high_request)
-            problems: List of detected issues
-            data_point: Dictionary of parsed log data
-            bot_detected: Boolean indicating bot detection
-            bot_name: String identifying bot type if detected
-            is_high_request: Boolean indicating high-request IP
-    """
-    problems = []
-    bot_detected = False
-    bot_name = None
-    is_high_request = False
-
-    # Regular expression pattern to parse common log format
-    pattern = r'^(\S+) - (\S+) - \[(.*?)\] "(\S+) (\S+) (\S+)" (\d{3}) (\d+) "([^"]*)" "([^"]*)" (\d+)$'
-    match = re.match(pattern, line.strip())
-
+    match = LOG_PATTERN.match(line.strip())
     if not match:
-        return ["Malformed log entry"], None, False, None, False
+        return None
 
-    # Extract components from log line
     ip, auth, timestamp, method, path, protocol, status, bytes_sent, referer, user_agent, response_time = match.groups()
 
-    # High request check (if we have the IP list)
-    if high_request_ips and ip in high_request_ips:
-        is_high_request = True
-        problems.append("High request count (potential bot)")
-
-    # Convert numerical values with error handling
     try:
-        status_code = int(status)
-        response_time_ms = int(response_time)
-        bytes_transferred = int(bytes_sent)
+        return LogEntry(
+            ip=ip,
+            auth=auth,
+            timestamp=timestamp,
+            method=method,
+            path=path,
+            protocol=protocol,
+            status=int(status),
+            bytes_sent=int(bytes_sent),
+            referer=referer,
+            user_agent=user_agent,
+            response_time=int(response_time),
+        )
     except ValueError:
-        problems.append("Invalid numerical values")
-        return problems, None, False, None, is_high_request
-
-    # Bot detection (user agent based)
-    if is_bot(user_agent):
-        bot_detected = True
-        # Try to extract bot name from user agent
-        if 'bot' in user_agent.lower():
-            bot_match = re.search(r'(\w+bot/\d+\.\d+|\w+bot)', user_agent, re.IGNORECASE)
-            if bot_match:
-                bot_name = bot_match.group(1)
-        elif 'google' in user_agent.lower():
-            bot_name = 'Googlebot'
-        elif 'bing' in user_agent.lower():
-            bot_name = 'Bingbot'
-        elif 'yahoo' in user_agent.lower():
-            bot_name = 'Yahoo Slurp'
-        else:
-            bot_name = "Unknown Bot"
-
-        problems.append("Bot detected")
-
-    # Status code checks
-    if 400 <= status_code < 500:
-        problems.append(f"Client error ({status_code})")
-    elif 500 <= status_code < 600:
-        problems.append(f"Server error ({status_code})")
-
-    # Performance issues
-    if response_time_ms > 500:
-        problems.append(f"Slow response (>500ms)")
-
-    # Missing or suspicious user agents
-    if user_agent in ('-', ''):
-        problems.append("Missing user agent")
-
-    # Suspicious paths detection
-    suspicious_paths = r'(admin|login|wp-admin|\.php|\.env|config|\.\./|/cgi-bin/)'
-    if re.search(suspicious_paths, path, re.IGNORECASE):
-        problems.append(f"Suspicious path")
-
-    # Authentication failures
-    if auth == 'NO':
-        problems.append("Authentication failed")
-
-    # Timestamp validation
-    try:
-        datetime.strptime(timestamp, '%d/%m/%Y:%H:%M:%S')
-    except ValueError:
-        problems.append(f"Invalid timestamp")
-
-    # Unusually large transfers
-    if bytes_transferred > 1000000:  # 1MB
-        problems.append(f"Large transfer (>1MB)")
-
-    # Package parsed data for visualization
-    data_point = {
-        'status': status_code,
-        'response_time': response_time_ms,
-        'bytes': bytes_transferred,
-        'path': path,
-        'method': method,
-        'ip': ip,
-        'user_agent': user_agent
-    }
-
-    return problems, data_point, bot_detected, bot_name, is_high_request
+        return None
 
 
-def visualize_data(problem_counts, status_codes, response_times, total_lines,
-                   suspicious_paths, top_ips, bot_stats, bot_types):
+def detect_issues(entry: LogEntry, high_request_ips: set) -> list:
     """
-    Generate a comprehensive visualization dashboard
+    Return a list of issue strings for a parsed log entry.
 
     Args:
-        problem_counts (Counter): Counts of different problem types
-        status_codes (Counter): HTTP status code distribution
-        response_times (list): List of response times in ms
-        total_lines (int): Total log entries processed
-        suspicious_paths (Counter): Counts of suspicious path accesses
-        top_ips (Counter): Top IP addresses by request count
-        bot_stats (dict): Statistics about bot traffic
-        bot_types (Counter): Counts of different bot types
+        entry:            A parsed LogEntry.
+        high_request_ips: Set of IPs that have exceeded the request threshold.
+
+    Returns:
+        A list of issue description strings (may be empty).
     """
-    # Create figure with 3x3 grid of subplots
-    plt.figure(figsize=(18, 15))
-    plt.suptitle(f"Log Analysis Summary ({total_lines} entries)", fontsize=16)
+    issues = []
 
-    # 1. Problem Type Distribution (Bar Chart)
-    plt.subplot(3, 3, 1)
-    if problem_counts:
-        problems, counts = zip(*sorted(problem_counts.items(), key=lambda x: x[1], reverse=True)[:8])
-        plt.bar(problems, counts, color='salmon')
-        plt.title('Top 8 Issues Detected')
-        plt.xticks(rotation=45, ha='right', fontsize=9)
-        plt.ylabel('Count')
-        plt.grid(axis='y', linestyle='--', alpha=0.7)
-    else:
-        plt.text(0.5, 0.5, 'No issues detected', ha='center', va='center', fontsize=12)
-        plt.title('No Issues Found')
+    if entry.ip in high_request_ips:
+        issues.append("High request count (potential bot)")
 
-    # 2. Status Code Distribution (Pie Chart)
-    plt.subplot(3, 3, 2)
-    if status_codes:
-        # Group status codes into categories
-        status_groups = {
-            '2xx Success': sum(count for code, count in status_codes.items() if 200 <= code < 300),
-            '3xx Redirection': sum(count for code, count in status_codes.items() if 300 <= code < 400),
-            '4xx Client Error': sum(count for code, count in status_codes.items() if 400 <= code < 500),
-            '5xx Server Error': sum(count for code, count in status_codes.items() if 500 <= code < 600),
-            'Other': sum(count for code, count in status_codes.items() if code < 200 or code >= 600)
-        }
+    if is_bot(entry.user_agent):
+        issues.append("Bot detected")
 
-        colors = ['#4CAF50', '#FFC107', '#FF9800', '#F44336', '#9E9E9E']
-        plt.pie(
-            status_groups.values(),
-            labels=status_groups.keys(),
-            autopct='%1.1f%%',
-            startangle=90,
-            colors=colors,
-            shadow=True,
-            explode=(0.05, 0.05, 0.05, 0.05, 0.05)
-        )
-        plt.title('Status Code Distribution')
-        plt.axis('equal')
-    else:
-        plt.text(0.5, 0.5, 'No status data', ha='center', va='center', fontsize=12)
-        plt.title('No Status Codes Found')
+    if 400 <= entry.status < 500:
+        issues.append(f"Client error ({entry.status})")
+    elif 500 <= entry.status < 600:
+        issues.append(f"Server error ({entry.status})")
 
-    # 3. Response Time Distribution (Histogram)
-    plt.subplot(3, 3, 3)
-    if response_times:
-        plt.hist(response_times, bins=50, color='#2196F3', edgecolor='black')
-        plt.title('Response Time Distribution')
-        plt.xlabel('Response Time (ms)')
-        plt.ylabel('Frequency')
-        plt.axvline(x=500, color='r', linestyle='--', label='500ms threshold')
-        plt.legend()
-        plt.grid(axis='y', linestyle='--', alpha=0.7)
-        plt.yscale('log')
-    else:
-        plt.text(0.5, 0.5, 'No response time data', ha='center', va='center', fontsize=12)
-        plt.title('No Response Times Found')
+    if entry.response_time > SLOW_RESPONSE_MS:
+        issues.append("Slow response (>500ms)")
 
-    # 4. Suspicious Paths (Horizontal Bar Chart)
-    plt.subplot(3, 3, 4)
-    if suspicious_paths:
-        paths, counts = zip(*suspicious_paths.most_common(8))
-        plt.barh(paths, counts, color='#FF5722')
-        plt.title('Top Suspicious Paths')
-        plt.xlabel('Access Count')
-        plt.grid(axis='x', linestyle='--', alpha=0.7)
-    else:
-        plt.text(0.5, 0.5, 'No suspicious paths', ha='center', va='center', fontsize=12)
-        plt.title('No Suspicious Paths Found')
+    if entry.user_agent in ("-", ""):
+        issues.append("Missing user agent")
 
-    # 5. Top IP Addresses (Horizontal Bar Chart)
-    plt.subplot(3, 3, 5)
-    if top_ips:
-        ips, counts = zip(*top_ips.most_common(8))
-        plt.barh(ips, counts, color='#9C27B0')
-        plt.title('Top Client IP Addresses')
-        plt.xlabel('Request Count')
-        plt.grid(axis='x', linestyle='--', alpha=0.7)
-    else:
-        plt.text(0.5, 0.5, 'No IP data', ha='center', va='center', fontsize=12)
-        plt.title('No IP Addresses Found')
+    if SUSPICIOUS_PATH_RE.search(entry.path):
+        issues.append("Suspicious path")
 
-    # 6. HTTP Methods (Pie Chart)
-    plt.subplot(3, 3, 6)
-    if hasattr(visualize_data, 'http_methods') and visualize_data.http_methods:
-        methods, counts = zip(*visualize_data.http_methods.items())
-        plt.pie(counts, labels=methods, autopct='%1.1f%%',
-                startangle=90, colors=plt.cm.Pastel1.colors)
-        plt.title('HTTP Method Distribution')
-        plt.axis('equal')
-    else:
-        plt.text(0.5, 0.5, 'No method data', ha='center', va='center', fontsize=12)
-        plt.title('No HTTP Methods Found')
+    if entry.auth == "NO":
+        issues.append("Authentication failed")
 
-    # 7. Traffic Composition (Pie Chart)
-    plt.subplot(3, 3, 7)
-    human_traffic = total_lines - bot_stats['total_bots'] - bot_stats['high_request_bots']
-    if human_traffic < total_lines:  # Only show if we have non-human traffic
-        sizes = [
-            human_traffic,
-            bot_stats['total_bots'],
-            bot_stats['high_request_bots']
-        ]
-        labels = ['Human Traffic', 'Known Bots', 'High-Request IPs']
-        colors = ['#66b3ff', '#ff9999', '#ffcc99']
-        explode = (0.1, 0, 0.1)
+    try:
+        datetime.strptime(entry.timestamp, "%d/%m/%Y:%H:%M:%S")
+    except ValueError:
+        issues.append("Invalid timestamp")
 
-        plt.pie(sizes, explode=explode, labels=labels, colors=colors,
-                autopct='%1.1f%%', shadow=True, startangle=90)
-        plt.axis('equal')
-        plt.title('Traffic Composition')
-    else:
-        plt.text(0.5, 0.5, 'No bot traffic detected', ha='center', va='center', fontsize=12)
-        plt.title('No Bot Traffic')
+    if entry.bytes_sent > LARGE_TRANSFER_BYTES:
+        issues.append("Large transfer (>1MB)")
 
-    # 8. Top Bot Types (Bar Chart)
-    plt.subplot(3, 3, 8)
-    if bot_types:
-        bots, counts = zip(*bot_types.most_common(8))
-        plt.bar(bots, counts, color='#FF9800')
-        plt.title('Top Bot Types')
-        plt.xticks(rotation=45, ha='right', fontsize=9)
-        plt.ylabel('Request Count')
-        plt.grid(axis='y', linestyle='--', alpha=0.7)
-    else:
-        plt.text(0.5, 0.5, 'No bot data', ha='center', va='center', fontsize=12)
-        plt.title('No Bot Types Found')
-
-    # 9. Bot Status Codes (Bar Chart)
-    plt.subplot(3, 3, 9)
-    if hasattr(visualize_data, 'bot_status_codes') and visualize_data.bot_status_codes:
-        codes, counts = zip(*sorted(visualize_data.bot_status_codes.items()))
-        plt.bar(codes, counts, color='#4CAF50')
-        plt.title('Bot Response Status Codes')
-        plt.xlabel('HTTP Status Code')
-        plt.ylabel('Count')
-        plt.grid(axis='y', linestyle='--', alpha=0.7)
-
-        # Annotate each bar with its count
-        for i, v in enumerate(counts):
-            plt.text(i, v + 0.5, str(v), ha='center', fontsize=9)
-    else:
-        plt.text(0.5, 0.5, 'No bot status data', ha='center', va='center', fontsize=12)
-        plt.title('No Bot Status Codes')
-
-    # Adjust layout and save
-    plt.tight_layout(rect=[0, 0, 1, 0.96])
-    plt.savefig('log_analysis_report.png', dpi=150)
-    print("Visualization saved as 'log_analysis_report.png'")
-    plt.show()
+    return issues
 
 
-def main():
+# ---------------------------------------------------------------------------
+# Analysis
+# ---------------------------------------------------------------------------
+
+def collect_ip_counts(filepath: str) -> Counter:
     """
-    Main function that orchestrates the log analysis workflow
+    Single-pass collection of per-IP request counts.
+
+    Args:
+        filepath: Path to the log file.
+
+    Returns:
+        A Counter mapping IP address to request count.
     """
-    # Download or use local log file
-    if not download_log_file():
-        print("Analysis aborted due to missing log file.")
-        return
+    ip_re = re.compile(r'^(\S+) -')
+    counts = Counter()
+    with open(filepath, "r", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            m = ip_re.match(line)
+            if m:
+                counts[m.group(1)] += 1
+    return counts
 
-    print(f"Analyzing log file: {LOCAL_LOG_FILE}")
 
-    # Initialize counters and trackers
+def analyse_entries(filepath: str, high_request_ips: set) -> AnalysisResult:
+    """
+    Full analysis pass over the log file.
+
+    Args:
+        filepath:         Path to the log file.
+        high_request_ips: Pre-computed set of high-volume IPs.
+
+    Returns:
+        A populated AnalysisResult dataclass.
+    """
     total_lines = 0
     problem_lines = 0
     problem_counts = Counter()
@@ -389,173 +320,353 @@ def main():
     suspicious_paths = Counter()
     ip_addresses = Counter()
     http_methods = Counter()
-
-    # Bot statistics dictionary
     bot_stats = {
-        'total_bots': 0,
-        'bot_ips': Counter(),
-        'bot_paths': Counter(),
-        'bot_status_codes': Counter(),
-        'high_request_bots': 0
+        "total_bots": 0,
+        "bot_ips": Counter(),
+        "bot_paths": Counter(),
+        "bot_status_codes": Counter(),
+        "high_request_bots": 0,
     }
     bot_types = Counter()
     problematic_entries = []
 
-    # FIRST PASS: Collect IP counts to identify high-volume requesters
-    print("First pass: Counting IP requests...")
-    with open(LOCAL_LOG_FILE, 'r') as file:
-        for line in file:
-            match = re.match(r'^(\S+) -', line.strip())
-            if match:
-                ip = match.group(1)
-                ip_addresses[ip] += 1
-
-    # Identify high-request IPs (>30 requests)
-    high_request_ips = {ip for ip, count in ip_addresses.items() if count > 30}
-    print(f"Found {len(high_request_ips)} IPs with >30 requests")
-
-    # SECOND PASS: Full analysis with high-request IP information
-    print("\nSecond pass: Analyzing log entries...")
-    with open(LOCAL_LOG_FILE, 'r') as file:
-        for line_number, line in enumerate(file, 1):
+    with open(filepath, "r", encoding="utf-8", errors="replace") as fh:
+        for line_number, line in enumerate(fh, 1):
             total_lines += 1
-            issues, data_point, is_bot_flag, bot_name, is_high_request = analyze_log_line(
-                line, high_request_ips
-            )
 
-            # Collect data for visualization
-            if data_point:
-                # Status code distribution
-                status_codes[data_point['status']] += 1
+            entry = parse_log_line(line)
+            if entry is None:
+                problem_lines += 1
+                problem_counts["Malformed log entry"] += 1
+                continue
 
-                # Response times
-                response_times.append(data_point['response_time'])
+            ip_addresses[entry.ip] += 1
+            status_codes[entry.status] += 1
+            response_times.append(entry.response_time)
+            http_methods[entry.method] += 1
 
-                # Track suspicious paths
-                if 'Suspicious path' in issues:
-                    suspicious_paths[data_point['path']] += 1
+            bot_detected = is_bot(entry.user_agent)
+            is_high_req = entry.ip in high_request_ips
 
-                # Track HTTP methods
-                http_methods[data_point['method']] += 1
+            if bot_detected:
+                bot_stats["total_bots"] += 1
+                bot_stats["bot_ips"][entry.ip] += 1
+                bot_stats["bot_paths"][entry.path] += 1
+                bot_stats["bot_status_codes"][entry.status] += 1
+                bot_types[extract_bot_name(entry.user_agent)] += 1
 
-                # Bot-specific tracking
-                if is_bot_flag:
-                    bot_stats['total_bots'] += 1
-                    bot_stats['bot_ips'][data_point['ip']] += 1
-                    bot_stats['bot_paths'][data_point['path']] += 1
-                    bot_stats['bot_status_codes'][data_point['status']] += 1
+            if is_high_req and not bot_detected:
+                bot_stats["high_request_bots"] += 1
 
-                    if bot_name:
-                        bot_types[bot_name] += 1
+            if SUSPICIOUS_PATH_RE.search(entry.path):
+                suspicious_paths[entry.path] += 1
 
-                # Track high-request IPs (that aren't already identified as bots)
-                if is_high_request and not is_bot_flag:
-                    bot_stats['high_request_bots'] += 1
+            issues = detect_issues(entry, high_request_ips)
 
-            # Record problematic entries
             if issues:
                 problem_lines += 1
                 problem_counts.update(issues)
+                problematic_entries.append({
+                    "line": line_number,
+                    "ip": entry.ip,
+                    "method": entry.method,
+                    "path": entry.path,
+                    "status": entry.status,
+                    "response_time": entry.response_time,
+                    "bytes": entry.bytes_sent,
+                    "issues": list(set(issues)),
+                })
 
-                if data_point:
-                    entry = {
-                        'line': line_number,
-                        'ip': data_point['ip'],
-                        'method': data_point['method'],
-                        'path': data_point['path'],
-                        'status': data_point['status'],
-                        'response_time': data_point['response_time'],
-                        'bytes': data_point['bytes'],
-                        'issues': list(set(issues))  # Remove duplicates
-                    }
-                    problematic_entries.append(entry)
+    return AnalysisResult(
+        total_lines=total_lines,
+        problem_lines=problem_lines,
+        problem_counts=problem_counts,
+        status_codes=status_codes,
+        response_times=response_times,
+        suspicious_paths=suspicious_paths,
+        ip_addresses=ip_addresses,
+        http_methods=http_methods,
+        bot_stats=bot_stats,
+        bot_types=bot_types,
+        problematic_entries=problematic_entries,
+    )
 
-    # Attach additional data to visualization function
-    visualize_data.http_methods = http_methods
-    visualize_data.bot_status_codes = bot_stats['bot_status_codes']
 
-    # Print summary statistics
-    print("\nAnalysis Summary:")
-    print(f"Total lines processed: {total_lines}")
-    print(f"Problematic lines found: {problem_lines}")
-    print(f"Known bots detected: {bot_stats['total_bots']} ({bot_stats['total_bots'] / total_lines * 100:.2f}%)")
-    print(
-        f"High-request IPs detected: {bot_stats['high_request_bots']} ({bot_stats['high_request_bots'] / total_lines * 100:.2f}%)")
+# ---------------------------------------------------------------------------
+# Reporting
+# ---------------------------------------------------------------------------
 
-    if total_lines > 0:
-        print(f"Percentage problematic: {problem_lines / total_lines * 100:.2f}%")
+def print_report(result: AnalysisResult) -> None:
+    """
+    Print a summary of the analysis results.
 
-    # Print top problems if any
-    if problem_counts:
-        print("\nTop Issues:")
-        for issue, count in problem_counts.most_common(10):
-            print(f"  {issue}: {count} occurrences")
+    Args:
+        result: A completed AnalysisResult.
+    """
+    t = result.total_lines
+    b = result.bot_stats
 
-    # Print top IP addresses
-    top_ips = ip_addresses.most_common(8)
-    if top_ips:
-        print("\nTop Client IP Addresses:")
-        for ip, count in top_ips:
-            print(f"  {ip}: {count} requests")
+    log.info("Analysis Summary")
+    log.info("  Total lines processed : %d", t)
+    log.info("  Problematic lines     : %d", result.problem_lines)
 
-    # Bot summary
-    if bot_stats['total_bots'] > 0 or bot_stats['high_request_bots'] > 0:
-        print("\nBot Traffic Analysis:")
-        print(f"Total known bot requests: {bot_stats['total_bots']}")
-        print(f"Total high-request IPs: {bot_stats['high_request_bots']}")
-        print(f"Top bot types: {bot_types.most_common(5)}")
-        print(f"Top bot IPs: {bot_stats['bot_ips'].most_common(5)}")
-        print(f"Top paths accessed by bots: {bot_stats['bot_paths'].most_common(5)}")
-        print(f"Bot status codes: {bot_stats['bot_status_codes'].most_common(5)}")
+    if t > 0:
+        log.info("  Known bots            : %d (%.2f%%)", b["total_bots"], b["total_bots"] / t * 100)
+        log.info("  High-request IPs      : %d (%.2f%%)", b["high_request_bots"], b["high_request_bots"] / t * 100)
+        log.info("  Percentage problematic: %.2f%%", result.problem_lines / t * 100)
 
-    # Print problematic HTTP requests (first 10)
-    if problematic_entries:
-        print("\nProblematic HTTP Requests (First 10):")
-        print("Line | IP Address    | Method | Path                 | Status | Time(ms) | Size   | Issues")
-        print("-" * 95)
+    if result.problem_counts:
+        log.info("Top issues:")
+        for issue, count in result.problem_counts.most_common(10):
+            log.info("    %-40s %d", issue, count)
 
-        for entry in problematic_entries[:10]:
-            print(
-                f"{entry['line']:<4} | {entry['ip']:<13} | {entry['method']:<6} | "
+    if result.ip_addresses:
+        log.info("Top client IP addresses:")
+        for ip, count in result.ip_addresses.most_common(8):
+            log.info("    %-18s %d requests", ip, count)
+
+    if b["total_bots"] > 0 or b["high_request_bots"] > 0:
+        log.info("Bot traffic analysis:")
+        log.info("  Total bot requests : %d", b["total_bots"])
+        log.info("  High-request IPs   : %d", b["high_request_bots"])
+        log.info("  Top bot types      : %s", result.bot_types.most_common(5))
+        log.info("  Top bot IPs        : %s", b["bot_ips"].most_common(5))
+        log.info("  Top bot paths      : %s", b["bot_paths"].most_common(5))
+        log.info("  Bot status codes   : %s", b["bot_status_codes"].most_common(5))
+
+
+def save_problematic_report(result: AnalysisResult) -> None:
+    """
+    Save the full list of problematic requests to a log file in OUTPUT_DIR.
+
+    Args:
+        result: A completed AnalysisResult.
+    """
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    out_path = os.path.join(OUTPUT_DIR, "problematic_requests.log")
+
+    entries = result.problematic_entries
+    if not entries:
+        log.info("No problematic requests found.")
+        return
+
+    header = (
+        "Line | IP Address        | Method | Path                 "
+        "| Status | Time(ms) | Size   | Issues\n"
+        + "-" * 100 + "\n"
+    )
+
+    log.info("Problematic HTTP requests (first 10):")
+    log.info(header.rstrip())
+    for entry in entries[:10]:
+        log.info(
+            "%4d | %-17s | %-6s | %-20s | %-6d | %-8d | %-6d | %s",
+            entry["line"], entry["ip"], entry["method"],
+            entry["path"][:20], entry["status"],
+            entry["response_time"], entry["bytes"],
+            ", ".join(entry["issues"][:2]),
+        )
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("Full List of Problematic Requests:\n")
+        f.write(header)
+        for entry in entries:
+            f.write(
+                f"{entry['line']:<4} | {entry['ip']:<17} | {entry['method']:<6} | "
                 f"{entry['path'][:20]:<20} | {entry['status']:<6} | "
-                f"{entry['response_time']:<8} | {entry['bytes']:<6} | {', '.join(entry['issues'][:2])}"
+                f"{entry['response_time']:<8} | {entry['bytes']:<6} | "
+                f"{', '.join(entry['issues'])}\n"
             )
 
-        # Save full report to file
-        with open('problematic_requests.log', 'w') as f:
-            f.write("Full List of Problematic Requests:\n")
-            f.write("Line | IP Address    | Method | Path                 | Status | Time(ms) | Size   | Issues\n")
-            f.write("-" * 95 + "\n")
-            for entry in problematic_entries:
-                f.write(
-                    f"{entry['line']:<4} | {entry['ip']:<13} | {entry['method']:<6} | "
-                    f"{entry['path'][:20]:<20} | {entry['status']:<6} | "
-                    f"{entry['response_time']:<8} | {entry['bytes']:<6} | {', '.join(entry['issues'])}\n"
-                )
-        print(f"\nSaved full report of {len(problematic_entries)} problematic requests to 'problematic_requests.log'")
-    else:
-        print("\nNo problematic requests found")
+    log.info("Saved full report of %d entries to '%s'", len(entries), out_path)
 
-    # Generate visualizations if matplotlib is available
-    try:
-        import matplotlib
-        print("\nGenerating visualizations...")
-        visualize_data(problem_counts, status_codes, response_times, total_lines,
-                       suspicious_paths, ip_addresses, bot_stats, bot_types)
-    except ImportError:
-        print("\nVisualization skipped: matplotlib not installed.")
-        print("Install it with: pip install matplotlib")
+
+# ---------------------------------------------------------------------------
+# Visualisation
+# ---------------------------------------------------------------------------
+
+def visualize_data(result: AnalysisResult) -> None:
+    """
+    Generate and save a 3x3 visualisation dashboard as a PNG into OUTPUT_DIR.
+
+    Args:
+        result: A completed AnalysisResult.
+    """
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    out_path = os.path.join(OUTPUT_DIR, "log_analysis_report.png")
+
+    t = result.total_lines
+    bot_stats = result.bot_stats
+
+    fig, axes = plt.subplots(3, 3, figsize=(18, 15))
+    fig.suptitle(f"Log Analysis Summary ({t} entries)", fontsize=16)
+
+    # 1. Problem type distribution
+    ax = axes[0, 0]
+    if result.problem_counts:
+        items = sorted(result.problem_counts.items(), key=lambda x: x[1], reverse=True)[:8]
+        problems, counts = zip(*items)
+        ax.bar(problems, counts, color="salmon")
+        ax.set_title("Top 8 issues detected")
+        ax.set_ylabel("Count")
+        ax.tick_params(axis="x", rotation=45, labelsize=9)
+        ax.grid(axis="y", linestyle="--", alpha=0.7)
+    else:
+        ax.text(0.5, 0.5, "No issues detected", ha="center", va="center")
+        ax.set_title("No issues found")
+
+    # 2. Status code distribution
+    ax = axes[0, 1]
+    if result.status_codes:
+        status_groups = {
+            "2xx Success":    sum(c for code, c in result.status_codes.items() if 200 <= code < 300),
+            "3xx Redirect":   sum(c for code, c in result.status_codes.items() if 300 <= code < 400),
+            "4xx Client err": sum(c for code, c in result.status_codes.items() if 400 <= code < 500),
+            "5xx Server err": sum(c for code, c in result.status_codes.items() if 500 <= code < 600),
+            "Other":          sum(c for code, c in result.status_codes.items() if code < 200 or code >= 600),
+        }
+        # Only pass non-zero slices to avoid explode length mismatch
+        non_zero = {k: v for k, v in status_groups.items() if v > 0}
+        colors = ["#4CAF50", "#FFC107", "#FF9800", "#F44336", "#9E9E9E"][:len(non_zero)]
+        explode = [0.05] * len(non_zero)
+        ax.pie(
+            non_zero.values(), labels=non_zero.keys(),
+            autopct="%1.1f%%", startangle=90,
+            colors=colors, shadow=True, explode=explode,
+        )
+        ax.set_title("Status code distribution")
+        ax.axis("equal")
+    else:
+        ax.text(0.5, 0.5, "No status data", ha="center", va="center")
+        ax.set_title("No status codes found")
+
+    # 3. Response time distribution
+    ax = axes[0, 2]
+    if result.response_times:
+        ax.hist(result.response_times, bins=50, color="#2196F3", edgecolor="black")
+        ax.set_title("Response time distribution")
+        ax.set_xlabel("Response time (ms)")
+        ax.set_ylabel("Frequency")
+        ax.axvline(x=SLOW_RESPONSE_MS, color="r", linestyle="--", label=f"{SLOW_RESPONSE_MS}ms threshold")
+        ax.legend()
+        ax.grid(axis="y", linestyle="--", alpha=0.7)
+        ax.set_yscale("log")
+    else:
+        ax.text(0.5, 0.5, "No response time data", ha="center", va="center")
+        ax.set_title("No response times found")
+
+    # 4. Suspicious paths
+    ax = axes[1, 0]
+    if result.suspicious_paths:
+        paths, counts = zip(*result.suspicious_paths.most_common(8))
+        ax.barh(paths, counts, color="#FF5722")
+        ax.set_title("Top suspicious paths")
+        ax.set_xlabel("Access count")
+        ax.grid(axis="x", linestyle="--", alpha=0.7)
+    else:
+        ax.text(0.5, 0.5, "No suspicious paths", ha="center", va="center")
+        ax.set_title("No suspicious paths found")
+
+    # 5. Top IP addresses
+    ax = axes[1, 1]
+    if result.ip_addresses:
+        ips, counts = zip(*result.ip_addresses.most_common(8))
+        ax.barh(ips, counts, color="#9C27B0")
+        ax.set_title("Top client IP addresses")
+        ax.set_xlabel("Request count")
+        ax.grid(axis="x", linestyle="--", alpha=0.7)
+    else:
+        ax.text(0.5, 0.5, "No IP data", ha="center", va="center")
+        ax.set_title("No IP addresses found")
+
+    # 6. HTTP methods
+    ax = axes[1, 2]
+    if result.http_methods:
+        methods, counts = zip(*result.http_methods.items())
+        ax.pie(counts, labels=methods, autopct="%1.1f%%",
+               startangle=90, colors=plt.cm.Pastel1.colors)
+        ax.set_title("HTTP method distribution")
+        ax.axis("equal")
+    else:
+        ax.text(0.5, 0.5, "No method data", ha="center", va="center")
+        ax.set_title("No HTTP methods found")
+
+    # 7. Traffic composition
+    ax = axes[2, 0]
+    human_traffic = t - bot_stats["total_bots"] - bot_stats["high_request_bots"]
+    if human_traffic < t:
+        sizes = [human_traffic, bot_stats["total_bots"], bot_stats["high_request_bots"]]
+        labels = ["Human traffic", "Known bots", "High-request IPs"]
+        ax.pie(sizes, explode=(0.1, 0, 0.1), labels=labels,
+               colors=["#66b3ff", "#ff9999", "#ffcc99"],
+               autopct="%1.1f%%", shadow=True, startangle=90)
+        ax.axis("equal")
+        ax.set_title("Traffic composition")
+    else:
+        ax.text(0.5, 0.5, "No bot traffic detected", ha="center", va="center")
+        ax.set_title("No bot traffic")
+
+    # 8. Top bot types
+    ax = axes[2, 1]
+    if result.bot_types:
+        bots, counts = zip(*result.bot_types.most_common(8))
+        ax.bar(bots, counts, color="#FF9800")
+        ax.set_title("Top bot types")
+        ax.tick_params(axis="x", rotation=45, labelsize=9)
+        ax.set_ylabel("Request count")
+        ax.grid(axis="y", linestyle="--", alpha=0.7)
+    else:
+        ax.text(0.5, 0.5, "No bot data", ha="center", va="center")
+        ax.set_title("No bot types found")
+
+    # 9. Bot status codes
+    ax = axes[2, 2]
+    if bot_stats["bot_status_codes"]:
+        codes, counts = zip(*sorted(bot_stats["bot_status_codes"].items()))
+        x_pos = range(len(codes))
+        ax.bar(x_pos, counts, color="#4CAF50")
+        ax.set_xticks(list(x_pos))
+        ax.set_xticklabels([str(c) for c in codes])
+        ax.set_title("Bot response status codes")
+        ax.set_xlabel("HTTP status code")
+        ax.set_ylabel("Count")
+        ax.grid(axis="y", linestyle="--", alpha=0.7)
+        for i, v in enumerate(counts):
+            ax.text(i, v + 0.5, str(v), ha="center", fontsize=9)
+    else:
+        ax.text(0.5, 0.5, "No bot status data", ha="center", va="center")
+        ax.set_title("No bot status codes")
+
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    log.info("Visualisation saved to '%s'", out_path)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    """Orchestrate the full log analysis workflow."""
+    if not download_log_file():
+        log.error("Analysis aborted: log file unavailable.")
+        return
+
+    log.info("Analysing log file: %s", LOCAL_LOG_FILE)
+
+    log.info("Counting IP requests...")
+    ip_counts = collect_ip_counts(LOCAL_LOG_FILE)
+    high_request_ips = {ip for ip, count in ip_counts.items() if count > HIGH_REQUEST_THRESHOLD}
+    log.info("Found %d IPs with >%d requests", len(high_request_ips), HIGH_REQUEST_THRESHOLD)
+
+    log.info("Analysing log entries...")
+    result = analyse_entries(LOCAL_LOG_FILE, high_request_ips)
+
+    print_report(result)
+    save_problematic_report(result)
+    visualize_data(result)
 
 
 if __name__ == "__main__":
-    # Install requests if needed
-    try:
-        import requests
-    except ImportError:
-        print("Installing required module: requests")
-        import subprocess
-
-        subprocess.check_call(["pip", "install", "requests"])
-        import requests
-
     main()
